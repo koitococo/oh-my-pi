@@ -1,0 +1,41 @@
+name: Sync upstream tags
+
+# Schedule runs on the default branch, daily at 03:17 UTC (11:17 UTC+8).
+# Manual runs sync the selected branch with the same-named upstream branch.
+# Uses only GITHUB_TOKEN; repository rules must permit its force-with-lease push.
+# Rebase conflicts and rejected pushes fail the run without bypassing protections.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'koitococo/oh-my-pi' && github.ref_type == 'branch'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+          persist-credentials: true
+      - name: Configure Git bot identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Sync matching upstream branch tag
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+          UPSTREAM_URL: https://github.com/can1357/oh-my-pi.git
+        run: bash scripts/sync-upstream-tags.sh "$TARGET_BRANCH" "$UPSTREAM_URL"
