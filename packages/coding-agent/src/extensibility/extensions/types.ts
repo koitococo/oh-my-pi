@@ -620,9 +620,77 @@ export type ExtensionAnnotationsFactory = (
 	sendUserMessage: (text: string, options?: SendUserMessageOptions) => void,
 ) => ExtensionAnnotationsAPI;
 
+export interface InteractionScope {
+	instanceId: string;
+	sessionId: string;
+	requestId: string;
+	revision: number;
+}
+export type InteractionActionId =
+	| "ask.submit"
+	| "ask.chat"
+	| "plan.approve.execute"
+	| "plan.approve.compact"
+	| "plan.approve.keep_context"
+	| "plan.refine"
+	| "plan.save_and_quit"
+	| "cancel";
+export interface InteractionAction {
+	id: InteractionActionId;
+	label: string;
+	disabled?: boolean;
+	localRequired?: boolean;
+}
+export interface InteractionPlanAnnotation {
+	section: { index: number; title: string; path?: string[]; contentHash?: string };
+	target: { kind: "section" } | { kind: "line"; row: number; context: string; contextTruncated?: boolean };
+	note: string;
+}
+export interface AskInteraction extends InteractionScope {
+	kind: "ask";
+	questions: ExtensionAskDialogQuestion[];
+	timeout?: number;
+	actions: InteractionAction[];
+}
+export interface PlanReviewInteraction extends InteractionScope {
+	kind: "plan_review";
+	plan: string;
+	planFilePath: string;
+	planTitle?: string;
+	contentHash: string;
+	feedback?: string;
+	annotations: InteractionPlanAnnotation[];
+	models: { id: string; label: string }[];
+	selectedModelId?: string;
+	actions: InteractionAction[];
+}
+export type PendingInteraction = AskInteraction | PlanReviewInteraction;
+export interface InteractionResponse extends InteractionScope {
+	action: InteractionActionId;
+	answers?: { id: string; selectedOptions: string[]; customAnswer?: string; note?: string }[];
+	feedback?: string;
+	modelId?: string;
+}
+export interface InteractionResponseResult {
+	status: "accepted" | "invalid" | "stale" | "local_required";
+	message?: string;
+	receiptId?: string;
+}
+export interface InteractionRequestEvent {
+	type: "interaction_request";
+	change: "opened" | "updated" | "closed";
+	request: PendingInteraction;
+	reason?: string;
+	receiptId?: string;
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
+	/** Immutable snapshots of currently answerable native ask/plan reviews. */
+	getPendingInteractions(): PendingInteraction[];
+	/** Accept a scoped decision, not proof of execution or model completion. */
+	respondToInteraction(response: InteractionResponse): Promise<InteractionResponseResult>;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
 	mode: ExtensionMode;
 	/** Get current context usage for the active model. */
@@ -1342,6 +1410,7 @@ export function isToolCallEventType(toolName: string, event: ToolCallEvent): boo
 
 /** Union of all event types */
 export type ExtensionEvent =
+	| InteractionRequestEvent
 	| ResourcesDiscoverEvent
 	| SessionEvent
 	| ContextEvent
@@ -1519,6 +1588,7 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
+	on(event: "interaction_request", handler: ExtensionHandler<InteractionRequestEvent>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
 	on(
 		event: "session_before_switch",

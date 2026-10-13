@@ -2,6 +2,7 @@
  * Interactive mode for the coding agent.
  * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -86,7 +87,8 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions } from "../extensibility/extensions/types";
+import type { CompactOptions, InteractionActionId, PlanReviewInteraction } from "../extensibility/extensions/types";
+import type { InteractionHandle } from "../extensibility/extensions/interaction-broker";
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -1554,6 +1556,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Re-renders the open jobs sheet so output tails and pids stay live. */
 	#jobsSheetTimer: NodeJS.Timeout | undefined;
 	#planReviewCancel: (() => void) | undefined;
+	#planReviewInteractionClose: (() => void) | undefined;
 	/** Serializable review annotations keyed by the resolved plan file path. */
 	#planReviewAnnotationState = new Map<string, PlanReviewAnnotationState>();
 	/** Annotation state held until the associated queued refinement actually starts. */
@@ -5292,6 +5295,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			annotationState?: PlanReviewAnnotationState;
 			onAnnotationStateChange?: (state: PlanReviewAnnotationState) => void;
 			initialIndex?: number;
+			onReady?: (finish: (choice: string | undefined) => void) => void;
+			onDecision?: (choice: string | undefined) => void;
 		},
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
@@ -5317,8 +5322,8 @@ export class InteractiveMode implements InteractiveModeContext {
 				annotationState: dialogOptions?.annotationState,
 			},
 			{
-				onPick: choice => finish(choice),
-				onCancel: () => finish(undefined),
+				onPick: choice => (dialogOptions?.onDecision ? dialogOptions.onDecision(choice) : finish(choice)),
+				onCancel: () => (dialogOptions?.onDecision ? dialogOptions.onDecision(undefined) : finish(undefined)),
 				onCopyPlan: content => void this.#copyPlanToClipboard(content),
 				onExternalEditor: dialogOptions?.onExternalEditor,
 				onAnnotationExternalEditor: (draft, commit) => void this.#openPlanAnnotationInExternalEditor(draft, commit),
@@ -5328,6 +5333,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			},
 		);
 		this.#planReviewOverlay = overlay;
+		dialogOptions?.onReady?.(finish);
 		this.#planReviewOverlayHandle = this.ui.showOverlay(overlay, {
 			anchor: "bottom-center",
 			width: "100%",
@@ -5341,6 +5347,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#hidePlanReview(): void {
+		this.#planReviewInteractionClose?.();
+		this.#planReviewInteractionClose = undefined;
+		this.#planReviewCancel?.();
 		this.#planReviewCancel = undefined;
 		this.#planReviewOverlayHandle?.hide();
 		this.#planReviewOverlayHandle = undefined;
@@ -5525,6 +5534,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #openPlanInExternalEditor(planFilePath: string): Promise<void> {
+		const reviewOverlay = this.#planReviewOverlay;
 		const editorCmd = getEditorCommand();
 		if (!editorCmd) {
 			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
@@ -5544,15 +5554,17 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
+		if (this.#planReviewOverlay !== reviewOverlay) return;
 		try {
 			this.ui.stop();
 			const result = await openInEditor(editorCmd, currentText, {
 				extension: path.extname(resolvedPath) || ".md",
 				trimTrailingNewline: false,
 			});
+			if (this.#planReviewOverlay !== reviewOverlay) return;
 			if (result !== null) {
 				await Bun.write(resolvedPath, result);
-				this.#planReviewOverlay?.setPlanContent(result);
+				if (this.#planReviewOverlay === reviewOverlay) reviewOverlay?.setPlanContent(result);
 				this.showStatus("Plan updated in external editor.");
 			}
 		} catch (error) {
@@ -5615,8 +5627,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			preserveContext?: boolean;
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
+			reviewOverlay?: PlanReviewOverlay;
 		},
 	): Promise<boolean> {
+		let approvalSessionId = this.sessionManager.getSessionId();
 		const previousPresentation = this.#planModePreviousToolPresentation ?? {
 			enabled: this.session.getEnabledToolNames().filter(name => !isMCPToolName(name)),
 			mounted: this.session.getMountedXdevToolNames().filter(name => !isMCPToolName(name)),
@@ -5638,10 +5652,15 @@ export class InteractiveMode implements InteractiveModeContext {
 				paused: false,
 				deferModelRestore: options.compactBeforeExecute === true,
 			});
+			if (this.sessionManager.getSessionId() !== approvalSessionId) {
+				throw new Error("Session changed during plan approval.");
+			}
 
 			if (!options.preserveContext) {
 				const oldLocalRoot = this.#resolveLocalRoot();
 				await this.handleClearCommand();
+				// The native execute action intentionally hands off to its fresh session.
+				approvalSessionId = this.sessionManager.getSessionId();
 				const newLocalRoot = this.#resolveLocalRoot();
 				await copyLocalArtifacts(oldLocalRoot, newLocalRoot);
 				const newLocalPath = this.#resolvePlanFilePath(options.planFilePath);
@@ -5750,6 +5769,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		const seededName = humanizePlanTitle(options.title);
 		if (seededName && !this.sessionManager.getSessionName()) {
 			await this.sessionManager.setSessionName(seededName, "auto");
+		}
+
+		if (this.sessionManager.getSessionId() !== approvalSessionId) {
+			throw new Error("Session changed during plan approval; execution was not dispatched.");
+		}
+		if (options.reviewOverlay && this.#planReviewOverlay && this.#planReviewOverlay !== options.reviewOverlay) {
+			throw new Error("Plan review was replaced; execution was not dispatched.");
 		}
 
 		// markPlanReferenceSent fires only on the dispatch path so the synthetic
@@ -6515,6 +6541,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const defaultTierIndex = cycle ? cycle.models.findIndex(entry => entry.role === "default") : -1;
 		const startTierIndex = defaultTierIndex >= 0 ? defaultTierIndex : (cycle?.currentIndex ?? 0);
 		let selectedTierIndex = startTierIndex;
+		let publishUpdate = (): void => {};
 		const slider: HookSelectorSlider | undefined =
 			cycle && cycle.models.length > 1
 				? {
@@ -6526,6 +6553,7 @@ export class InteractiveMode implements InteractiveModeContext {
 						})),
 						onChange: index => {
 							selectedTierIndex = index;
+							publishUpdate();
 						},
 					}
 				: undefined;
@@ -6538,6 +6566,60 @@ export class InteractiveMode implements InteractiveModeContext {
 		let editedContent: string | undefined;
 		let feedback = "";
 		const annotationStateKey = this.#resolvePlanFilePath(planFilePath);
+		const broker = this.session.extensionRunner?.interactions;
+		let interaction: InteractionHandle | undefined;
+		let finishReview: ((choice: string | undefined) => void) | undefined;
+		let reviewOverlay: PlanReviewOverlay | undefined;
+		let reviewedContent = planContent;
+		let planWrite: Promise<unknown> = Promise.resolve();
+		const reviewSessionId = this.sessionManager.getSessionId();
+		const modelId = (index: number): string | undefined => {
+			const entry = cycle?.models[index];
+			return entry
+				? JSON.stringify([
+						entry.role,
+						entry.model.provider,
+						entry.model.id,
+						entry.thinkingLevel ?? null,
+						entry.explicitThinkingLevel ?? false,
+					])
+				: undefined;
+		};
+		const actionChoices: Partial<Record<InteractionActionId, string>> = {
+			"plan.approve.execute": "Approve and execute",
+			"plan.approve.compact": "Approve and compact context",
+			"plan.approve.keep_context": keepContextLabel,
+			"plan.refine": "Refine plan",
+			"plan.save_and_quit": PLAN_SAVE_AND_QUIT_OPTION,
+		};
+		const snapshot = (): Omit<PlanReviewInteraction, "instanceId" | "sessionId" | "requestId" | "revision"> => ({
+			kind: "plan_review",
+			plan: reviewedContent,
+			planFilePath,
+			planTitle: details.title,
+			contentHash: createHash("sha256").update(reviewedContent).digest("hex"),
+			feedback,
+			annotations: this.#planReviewAnnotationState.get(annotationStateKey)?.annotations ?? [],
+			models:
+				slider && cycle
+					? cycle.models.map((entry, index) => ({
+							id: modelId(index)!,
+							label: `${entry.role}: ${entry.model.name || entry.model.id} (${entry.thinkingLevel ?? "default"} thinking)`,
+						}))
+					: [],
+			selectedModelId: slider ? modelId(selectedTierIndex) : undefined,
+			actions: [
+				{ id: "plan.approve.execute", label: "Approve and execute" },
+				{ id: "plan.approve.compact", label: "Approve and compact context" },
+				{ id: "plan.approve.keep_context", label: keepContextLabel, disabled: keepContextDisabled },
+				{ id: "plan.refine", label: "Refine plan" },
+				{ id: "plan.save_and_quit", label: PLAN_SAVE_AND_QUIT_OPTION, localRequired: true },
+				{ id: "cancel", label: "Cancel" },
+			],
+		});
+		publishUpdate = () => interaction?.update(snapshot());
+		const closeCapability = (): void => interaction?.close("aborted");
+		this.#dialogLifetime.signal.addEventListener("abort", closeCapability, { once: true });
 
 		const choice = await this.showPlanReview(
 			planContent,
@@ -6551,24 +6633,160 @@ export class InteractiveMode implements InteractiveModeContext {
 			],
 			{
 				helpText,
-				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
+				onReady: finish => {
+					finishReview = finish;
+					reviewOverlay = this.#planReviewOverlay;
+					if (this.#dialogLifetime.signal.aborted || this.sessionManager.getSessionId() !== reviewSessionId) {
+						finish(undefined);
+						return;
+					}
+					interaction = broker?.open(snapshot(), {
+						validate: async response => {
+							if (this.sessionManager.getSessionId() !== reviewSessionId || !this.planModeEnabled) {
+								interaction?.close("session_changed");
+								return "Plan review is no longer active.";
+							}
+							if (response.modelId && !snapshot().models.some(model => model.id === response.modelId)) {
+								return "Unknown execution model.";
+							}
+							if (response.action === "plan.refine" && !(response.feedback ?? feedback).trim()) {
+								return "Refinement requires feedback.";
+							}
+							if (response.action.startsWith("plan.approve.")) {
+								await planWrite;
+								if (
+									this.#planReviewOverlay !== reviewOverlay ||
+									interaction?.request.revision !== response.revision ||
+									!broker
+										?.getPendingInteractions()
+										.some(
+											request =>
+												request.requestId === response.requestId && request.revision === response.revision,
+										)
+								) {
+									return "Plan review changed while validating approval.";
+								}
+								const current = await this.#readPlanFile(planFilePath);
+								if (
+									this.#planReviewOverlay !== reviewOverlay ||
+									interaction?.request.revision !== response.revision ||
+									!broker
+										?.getPendingInteractions()
+										.some(
+											request =>
+												request.requestId === response.requestId && request.revision === response.revision,
+										)
+								) {
+									return "Plan review changed while reading approval content.";
+								}
+								if (current !== reviewedContent) {
+									if (current !== null) {
+										reviewedContent = current;
+										editedContent = undefined;
+										reviewOverlay?.setPlanContent(current);
+										publishUpdate();
+									} else {
+										interaction?.close("plan_missing");
+									}
+									return "Plan changed on disk. Review the updated plan before approving.";
+								}
+							}
+							return undefined;
+						},
+						resolve: response => {
+							reviewOverlay?.setDecisionPending(true, actionChoices[response.action]);
+							this.ui.requestRender();
+							if (response.feedback !== undefined) feedback = response.feedback;
+							if (response.modelId && cycle && response.modelId !== modelId(selectedTierIndex)) {
+								selectedTierIndex = cycle.models.findIndex((_, index) => modelId(index) === response.modelId);
+							}
+							finish(response.action === "cancel" ? undefined : actionChoices[response.action]);
+						},
+						onClose: reason => {
+							if (reason !== "accepted" && reason !== "local") finish(undefined);
+						},
+					});
+					this.#planReviewInteractionClose = () => interaction?.close("dismissed");
+				},
+				onDecision: selected => {
+					if (reviewOverlay && this.#planReviewOverlay !== reviewOverlay) return;
+					if (!interaction) {
+						finishReview?.(selected);
+						return;
+					}
+					if (selected === PLAN_SAVE_AND_QUIT_OPTION) {
+						interaction.close("local");
+						finishReview?.(selected);
+						return;
+					}
+					const action =
+						selected === undefined
+							? "cancel"
+							: (Object.entries(actionChoices).find(
+									([, label]) => label === selected,
+								)?.[0] as InteractionActionId);
+					void interaction.respond({ action }).then(result => {
+						if (
+							result.status !== "accepted" &&
+							this.#planReviewOverlay === reviewOverlay &&
+							broker
+								?.getPendingInteractions()
+								.some(request => request.requestId === interaction?.request.requestId)
+						) {
+							reviewOverlay?.setDecisionPending(false);
+							this.ui.requestRender();
+							this.showWarning(result.message ?? "Plan changed; review the current plan and retry.");
+						}
+					});
+				},
+				onExternalEditor: () => {
+					void this.#openPlanInExternalEditor(planFilePath).then(async () => {
+						if (this.#planReviewOverlay !== reviewOverlay) return;
+						const revision = interaction?.request.revision;
+						const previousContent = reviewedContent;
+						const current = await this.#readPlanFile(planFilePath);
+						if (
+							this.#planReviewOverlay !== reviewOverlay ||
+							interaction?.request.revision !== revision ||
+							reviewedContent !== previousContent
+						)
+							return;
+						if (current !== null && current !== reviewedContent) {
+							reviewedContent = current;
+							editedContent = undefined;
+							publishUpdate();
+						}
+					});
+				},
 				onPlanEdited: content => {
+					if (reviewOverlay && this.#planReviewOverlay !== reviewOverlay) return;
 					editedContent = content;
-					void Bun.write(this.#resolvePlanFilePath(planFilePath), content);
+					reviewedContent = content;
+					planWrite = planWrite.then(() => Bun.write(this.#resolvePlanFilePath(planFilePath), content));
+					publishUpdate();
 				},
 				onFeedbackChange: value => {
+					if (reviewOverlay && this.#planReviewOverlay !== reviewOverlay) return;
 					feedback = value;
+					publishUpdate();
 				},
 				annotationState: this.#planReviewAnnotationState.get(annotationStateKey),
 				onAnnotationStateChange: state => {
+					if (reviewOverlay && this.#planReviewOverlay !== reviewOverlay) return;
 					if (state.annotations.length > 0) this.#planReviewAnnotationState.set(annotationStateKey, state);
 					else this.#planReviewAnnotationState.delete(annotationStateKey);
+					publishUpdate();
 				},
 				disabledIndices: keepContextDisabled ? [PLAN_KEEP_CONTEXT_OPTION_INDEX] : undefined,
 			},
 			{ slider },
 		);
+		this.#dialogLifetime.signal.removeEventListener("abort", closeCapability);
+		interaction?.close("local");
+		if (this.sessionManager.getSessionId() !== reviewSessionId) return;
+		if (reviewOverlay && this.#planReviewOverlay !== reviewOverlay) return;
 		const closePlanReview = (): void => {
+			if (reviewOverlay && this.#planReviewOverlay !== reviewOverlay) return;
 			this.#hidePlanReview();
 			this.ui.requestRender();
 		};
@@ -6590,12 +6808,17 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
 			try {
-				// Prefer in-overlay edits (already in memory) over a disk re-read. The
-				// overlay mirrors edits as they happen, and approval awaits one final
-				// write so the durable plan file and synthetic prompt carry the same text.
-				const latestPlanContent = editedContent ?? (await this.#readPlanFile(planFilePath));
-				if (editedContent !== undefined) {
-					await Bun.write(this.#resolvePlanFilePath(planFilePath), editedContent);
+				await planWrite;
+				if (reviewOverlay && this.#planReviewOverlay !== reviewOverlay) return;
+				const latestPlanContent = await this.#readPlanFile(planFilePath);
+				if (
+					this.sessionManager.getSessionId() !== reviewSessionId ||
+					(reviewOverlay !== undefined && this.#planReviewOverlay !== reviewOverlay) ||
+					(broker && latestPlanContent !== reviewedContent)
+				) {
+					this.showWarning("Plan review changed before execution; reopen the plan review.");
+					closePlanReview();
+					return;
 				}
 				if (!latestPlanContent) {
 					this.showError(`Plan file not found at ${planFilePath}`);
@@ -6636,6 +6859,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					preserveContext: choice !== "Approve and execute",
 					compactBeforeExecute: choice === "Approve and compact context",
 					executionModel,
+					reviewOverlay,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {

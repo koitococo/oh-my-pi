@@ -9,6 +9,7 @@ import { ExtensionUiController } from "../../../src/modes/controllers/extension-
 import { InputController } from "../../../src/modes/controllers/input-controller";
 import { getEditorTheme, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../../src/modes/types";
+import { InteractionBroker } from "../../../src/extensibility/extensions/interaction-broker";
 
 afterEach(() => {
 	setKeybindings(KeybindingsManager.inMemory());
@@ -93,6 +94,102 @@ function makeHarness() {
 		},
 	};
 }
+
+describe("ExtensionUiController external Ask arbitration", () => {
+	const questions: ExtensionAskDialogQuestion[] = [
+		{ id: "answer", question: "Choose an answer?", options: [{ label: "Default" }, { label: "Alternative" }] },
+	];
+
+	function setup() {
+		const harness = makeHarness();
+		const broker = new InteractionBroker(
+			() => "ask-session",
+			() => {},
+		);
+		harness.controller.setInteractionBroker(broker);
+		return { ...harness, broker };
+	}
+
+	it("rejects invalid external answers without consuming the native dialog", async () => {
+		const harness = setup();
+		const pending = harness.controller.showAskDialog(questions);
+		const request = harness.broker.getPendingInteractions()[0]!;
+		expect(
+			await harness.broker.respondToInteraction({
+				...request,
+				action: "ask.submit",
+				answers: [{ id: "answer", selectedOptions: ["Not an option"] }],
+			}),
+		).toMatchObject({ status: "invalid" });
+		expect(harness.getFocused()).toBeInstanceOf(AskDialogComponent);
+		expect(harness.broker.getPendingInteractions()).toHaveLength(1);
+		harness.handleInput("\r");
+		expect(await pending).toMatchObject({ kind: "submit", results: [{ selectedOptions: ["Default"] }] });
+		expect(
+			await harness.broker.respondToInteraction({
+				...request,
+				action: "ask.submit",
+				answers: [{ id: "answer", selectedOptions: ["Alternative"] }],
+			}),
+		).toMatchObject({ status: "stale" });
+	});
+
+	it("external submission dismisses the nested editor and cannot be overwritten by its queued restoration", async () => {
+		const harness = setup();
+		const pending = harness.controller.showAskDialog(questions);
+		const request = harness.broker.getPendingInteractions()[0]!;
+		// Two options precede the native Other action.
+		harness.handleInput("\x1b[B");
+		harness.handleInput("\x1b[B");
+		harness.handleInput("\r");
+		expect(harness.getFocused()).toBeInstanceOf(HookEditorComponent);
+		harness.handleInput("unfinished local text");
+		expect(
+			await harness.broker.respondToInteraction({
+				...request,
+				action: "ask.submit",
+				answers: [{ id: "answer", selectedOptions: ["Alternative"], note: "remote note" }],
+			}),
+		).toMatchObject({ status: "accepted" });
+		expect(await pending).toMatchObject({
+			kind: "submit",
+			results: [{ id: "answer", selectedOptions: ["Alternative"], note: "remote note" }],
+		});
+		await Promise.resolve();
+		expect(harness.getFocused()).toBe(harness.editor);
+		expect(harness.editorContainer.children).toEqual([harness.editor]);
+		expect(harness.editor.getText()).toBe("");
+		expect(harness.broker.getPendingInteractions()).toHaveLength(0);
+	});
+
+	it.each(["aborted", "shutdown", "session_switch"])("revokes the external capability on %s", async reason => {
+		const harness = setup();
+		const abort = new AbortController();
+		const pending = harness.controller.showAskDialog(questions, { signal: abort.signal });
+		const request = harness.broker.getPendingInteractions()[0]!;
+		if (reason === "aborted") abort.abort();
+		else harness.broker.closeAll(reason);
+		expect(await pending).toBeUndefined();
+		expect(harness.getFocused()).toBe(harness.editor);
+		expect(
+			await harness.broker.respondToInteraction({
+				...request,
+				action: "ask.chat",
+			}),
+		).toMatchObject({ status: "stale" });
+	});
+
+	it("external Chat preserves the conversational handoff rather than submitting answers", async () => {
+		const harness = setup();
+		const pending = harness.controller.showAskDialog(questions);
+		const request = harness.broker.getPendingInteractions()[0]!;
+		expect(await harness.broker.respondToInteraction({ ...request, action: "ask.chat" })).toMatchObject({
+			status: "accepted",
+		});
+		expect(await pending).toEqual({ kind: "chat" });
+		expect(harness.getFocused()).toBe(harness.editor);
+	});
+});
 
 describe("ExtensionUiController Ask dialog input", () => {
 	const questions: ExtensionAskDialogQuestion[] = [

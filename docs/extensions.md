@@ -66,6 +66,49 @@ Important constraint from `loader.ts`:
 - `pi.exec()` is directly available during load; provider registration is queued until session setup
 - child sessions reuse imported factories but bind fresh APIs and extension registrations; module-level variables remain shared across those sessions
 
+## Native ask and plan-review interactions
+
+Interactive mode exposes its existing ask dialog and plan-review decisions through
+`ctx.getPendingInteractions()` and `ctx.respondToInteraction(response)`. Subscribe
+to `pi.on("interaction_request", ...)` before querying pending requests so a
+transport can recover after reconnect without missing a newly opened review.
+Events have `change: "opened" | "updated" | "closed"` and an immutable `request`
+snapshot. Enqueue transport work and return promptly; never wait for the human
+inside the event handler. Notification failures do not interrupt native UI.
+
+Every response must echo `instanceId`, `sessionId`, `requestId`, and `revision`
+from the current snapshot. The first valid native or extension response wins.
+`invalid` leaves the review open, `stale` means the capability or revision is no
+longer current, and `accepted` records a decision—not successful execution or
+model completion. Accepted decisions include a `receiptId`; closed events revoke
+the corresponding transport controls.
+
+Ask requests contain normalized questions, options, and optional timeout.
+`ask.submit` supplies `answers: [{ id, selectedOptions, customAnswer?, note? }]`;
+`ask.chat` hands off to conversational follow-up rather than answering the tool.
+Ask images are not transported. `cancel` dismisses either native interaction.
+
+Plan requests include complete Markdown, `planFilePath`, SHA-256 `contentHash`,
+feedback, serializable section/line annotations, available execution models, and
+action availability. Model IDs are opaque semantic identities for the exact native
+role, provider, model, and thinking configuration; send a listed ID unchanged,
+never derive a provider/model ID or send a cycle index. Actions are
+`plan.approve.execute`, `plan.approve.compact`,
+`plan.approve.keep_context`, and `plan.refine`. Refinement needs nonblank feedback.
+Approval runs the existing native clear/compact/keep-context orchestration;
+disabled actions cannot be selected. Compaction cancellation does not dispatch
+execution even though the approval decision was accepted.
+
+Local edits, annotations, feedback, or model changes publish a new revision.
+Approval re-reads the exact plan file; disk drift refreshes the review and rejects
+the obsolete revision. Session changes, aborts, and dismissed reviews revoke
+capabilities. `plan.save_and_quit` is `localRequired`: remote replies return
+`local_required` without consuming the review, because native saving requires a
+local path selector. This API does not provide generic approvals or mode control.
+
+For a project-local Slack transport with interactive ask and plan-review cards, see
+the [Chat SDK Slack extension README](../.omp/extensions/chat-sdk/README.md).
+
 ## Quick start
 
 ```ts

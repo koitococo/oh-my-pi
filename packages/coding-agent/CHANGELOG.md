@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Exposed native ask and plan-review interactions to extensions with scoped snapshots and first-valid-response arbitration, and added a project-local Chat SDK Slack extension for answering questions and reviewing plans through interactive cards. Remote plan decisions use native execution/compaction/refinement paths; save-and-quit remains in the local terminal.
+
 ## [18.10.3] - 2026-10-12
 
 ### Added

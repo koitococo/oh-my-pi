@@ -2,6 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { InteractionBroker } from "./interaction-broker";
 import {
 	type AgentMessage,
 	type AgentTool,
@@ -440,6 +441,7 @@ export type ShutdownHandler = () => void;
  */
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
 	if (!extensionRunner) return false;
+	extensionRunner.interactions.closeAll("session_shutdown");
 	try {
 		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
 		await extensionRunner.emit({
@@ -502,6 +504,12 @@ export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
 });
 
 export class ExtensionRunner {
+	readonly interactions = new InteractionBroker(
+		() => this.sessionId,
+		event => {
+			void this.emit(event);
+		},
+	);
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
@@ -784,6 +792,7 @@ export class ExtensionRunner {
 		uiContext?: ExtensionUIContext,
 		mode: ExtensionMode = "print",
 	): void {
+		if (this.#initialized) this.interactions.closeAll("rebound");
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
@@ -1381,6 +1390,8 @@ export class ExtensionRunner {
 			this.runtime.sendUserMessage(text, options);
 		return {
 			ui: this.#uiContext,
+			getPendingInteractions: () => this.interactions.getPendingInteractions(),
+			respondToInteraction: response => this.interactions.respondToInteraction(response),
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
@@ -1396,9 +1407,12 @@ export class ExtensionRunner {
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
 			isIdle: () => this.#isIdleFn(),
-			abort: () => this.#abortFn(),
+			abort: () => {
+				this.interactions.closeAll("aborted");
+				this.#abortFn();
+			},
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
-			shutdown: () => this.#shutdownHandler(),
+			shutdown: () => this.shutdown(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1457,6 +1471,7 @@ export class ExtensionRunner {
 	 * Request a graceful shutdown. Called by extension tools and event handlers.
 	 */
 	shutdown(): void {
+		this.interactions.closeAll("shutdown");
 		this.#shutdownHandler();
 	}
 
@@ -1595,6 +1610,14 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		if (
+			event.type === "session_shutdown" ||
+			event.type === "session_switch" ||
+			event.type === "session_branch" ||
+			event.type === "session_tree"
+		) {
+			this.interactions.closeAll(event.type);
+		}
 		// Defer the per-event context allocation (and the Promise.race/Bun.sleep
 		// timeout machinery) to the first matching handler. Streaming sessions emit
 		// message_update / tool_execution_* per delta with usually no extension

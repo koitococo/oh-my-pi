@@ -33,6 +33,7 @@ import type {
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
+import { InteractionBroker } from "../../src/extensibility/extensions/interaction-broker";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
 // ./helpers/in-memory-relay), same contract as the other collab tests.
@@ -815,6 +816,51 @@ function makeAskHostContext(): InteractiveModeContext {
 	};
 	return stub as unknown as InteractiveModeContext;
 }
+
+describe("guest Ask external interaction arbitration", () => {
+	it.each(["guest", "extension"])("accepts only the %s winner and revokes the other capability", async winner => {
+		const ctx = makeAskHostContext();
+		const host = new CollabHost(ctx);
+		await host.start("ws://localhost:8787");
+		ctx.collabHost = host;
+		const broker = new InteractionBroker(
+			() => "guest-ask-session",
+			() => {},
+		);
+		const controller = new ExtensionUiController(ctx);
+		controller.setInteractionBroker(broker);
+		const guest = await joinRawGuest(host.link, COLLAB_PROTO);
+		try {
+			expect((await guest.nextFrame()).t).toBe("welcome");
+			const pending = controller.showAskDialog([
+				{ id: "q1", question: "Who wins?", options: [{ label: "Guest" }, { label: "Extension" }] },
+			]);
+			const request = broker.getPendingInteractions()[0]!;
+			const frame = await guest.nextFrame();
+			if (frame.t !== "ui-request") throw new Error(`expected ui-request, got ${frame.t}`);
+			const reply = {
+				...request,
+				action: "ask.submit" as const,
+				answers: [{ id: "q1", selectedOptions: ["Extension"] }],
+			};
+			if (winner === "guest") {
+				guest.socket.send({ t: "ui-response", reqId: frame.request.reqId, value: "Guest" });
+				expect(await pending).toMatchObject({ kind: "submit", results: [{ selectedOptions: ["Guest"] }] });
+				expect(await broker.respondToInteraction(reply)).toMatchObject({ status: "stale" });
+			} else {
+				expect(await broker.respondToInteraction(reply)).toMatchObject({ status: "accepted" });
+				guest.socket.send({ t: "ui-response", reqId: frame.request.reqId, value: "Guest" });
+				expect(await pending).toMatchObject({ kind: "submit", results: [{ selectedOptions: ["Extension"] }] });
+			}
+			expect(broker.getPendingInteractions()).toHaveLength(0);
+			expect(host.inputRequired).toBe(false);
+		} finally {
+			broker.closeAll("test cleanup");
+			guest.socket.close();
+			await host.stop("test done");
+		}
+	});
+});
 
 describe("guest ask room ownership", () => {
 	it.each(["next question", "custom answer"])("does not mirror a %s to a successor room", async followup => {

@@ -25,6 +25,10 @@ import { setKeybindings } from "@oh-my-pi/pi-tui";
 import { formatNumber, TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgPlanAutosave, cfgPlanAutosaveDir } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
+import { InteractionBroker } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/interaction-broker";
+import type { InteractionRequestEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 
 /**
  * Matches the plan-approved synthetic-prompt dispatch. `#approvePlan` calls
@@ -102,6 +106,14 @@ describe("InteractiveMode plan review rendering", () => {
 			throw new Error("Expected claude-sonnet-4-5 to exist in registry");
 		}
 
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const extensionRunner = new ExtensionRunner(
+			[],
+			new ExtensionRuntime(),
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
 		session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -111,7 +123,8 @@ describe("InteractiveMode plan review rendering", () => {
 					messages: [],
 				},
 			}),
-			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			sessionManager,
+			extensionRunner,
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -131,6 +144,318 @@ describe("InteractiveMode plan review rendering", () => {
 		currentTempDir?.removeSync();
 		setKeybindings(KeybindingsManager.inMemory());
 	});
+
+	function attachInteractionBroker(broker: InteractionBroker): void {
+		const runner = session.extensionRunner;
+		if (!runner) throw new Error("Expected real fixture extension runner");
+		Object.defineProperty(runner, "interactions", { value: broker, configurable: true });
+	}
+
+	it("an older deferred approval read cannot overwrite a newer native section edit", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		const original = "# Plan\n\nIntro\n\n## Remove me\n\nOld section\n\n## Keep me\n\nKept section\n";
+		await Bun.write(resolvedPath, original);
+		const opened = Promise.withResolvers<InteractionRequestEvent>();
+		const broker = new InteractionBroker(
+			() => session.sessionManager.getSessionId(),
+			event => {
+				if (event.change === "opened") opened.resolve(event);
+			},
+		);
+		attachInteractionBroker(broker);
+		let overlay: PlanReviewOverlay | undefined;
+		vi.spyOn(mode.ui, "showOverlay").mockImplementation(component => {
+			overlay = component as PlanReviewOverlay;
+			return { hide: vi.fn() } as never;
+		});
+		mode.planModeEnabled = true;
+		const review = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Plan" });
+		const request = (await opened.promise).request;
+		const readEntered = Promise.withResolvers<void>();
+		const diskRead = Promise.withResolvers<string>();
+		const realFile = Bun.file.bind(Bun);
+		let delayNextRead = true;
+		vi.spyOn(Bun, "file").mockImplementation((source, options) => {
+			const file = realFile(source as string, options);
+			if (source === resolvedPath && delayNextRead) {
+				delayNextRead = false;
+				file.text = () => {
+					readEntered.resolve();
+					return diskRead.promise;
+				};
+			}
+			return file;
+		});
+		const reply = broker.respondToInteraction({ ...request, action: "plan.approve.execute" });
+		await readEntered.promise;
+		if (!overlay) throw new Error("Expected native review overlay");
+		overlay.render(120);
+		// The document title is omitted from Contents; its initial entry is "Remove me".
+		overlay.handleInput("\t");
+		overlay.handleInput("d");
+		const [edited] = broker.getPendingInteractions();
+		if (edited.kind !== "plan_review") throw new Error("Expected plan review");
+		expect(edited.revision).toBeGreaterThan(request.revision);
+		expect(edited.plan).not.toContain("Remove me");
+		diskRead.resolve(original);
+		expect((await reply).status).toBe("stale");
+		const [current] = broker.getPendingInteractions();
+		expect(current).toEqual(edited);
+		expect(overlay.render(120).join("\n")).not.toContain("Remove me");
+		await broker.respondToInteraction({ ...current, action: "cancel" });
+		await review;
+	});
+
+	it("a superseded approval continuation cannot dismiss its replacement review", async () => {
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nOverlapping reviews\n",
+		);
+		const firstOpened = Promise.withResolvers<InteractionRequestEvent>();
+		const secondOpened = Promise.withResolvers<InteractionRequestEvent>();
+		let openedCount = 0;
+		const broker = new InteractionBroker(
+			() => session.sessionManager.getSessionId(),
+			event => {
+				if (event.change !== "opened") return;
+				if (++openedCount === 1) firstOpened.resolve(event);
+				else secondOpened.resolve(event);
+			},
+		);
+		attachInteractionBroker(broker);
+		// Keep this regression focused on replacement, not native abort revocation.
+		vi.spyOn(session, "abort").mockResolvedValue();
+		const overlayHandles: Array<{ hide: () => void }> = [];
+		vi.spyOn(mode.ui, "showOverlay").mockImplementation(() => {
+			const handle = { hide: vi.fn() };
+			overlayHandles.push(handle);
+			return handle as never;
+		});
+		mode.planModeEnabled = true;
+		const details = { planFilePath, planExists: true, title: "Plan" };
+		const first = mode.handlePlanApproval(details);
+		const oldRequest = (await firstOpened.promise).request;
+		const second = mode.handlePlanApproval(details);
+		const newRequest = (await secondOpened.promise).request;
+		await first;
+		expect(overlayHandles[0].hide).toHaveBeenCalledTimes(1);
+		expect(overlayHandles[1].hide).not.toHaveBeenCalled();
+		expect(broker.getPendingInteractions().map(request => request.requestId)).toEqual([newRequest.requestId]);
+		expect((await broker.respondToInteraction({ ...oldRequest, action: "cancel" })).status).toBe("stale");
+		await broker.respondToInteraction({ ...newRequest, action: "cancel" });
+		await second;
+	});
+
+	it("remote model selection preserves separate roles with different thinking on the same model", async () => {
+		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5:off");
+		session.settings.setModelRole("slow", "anthropic/claude-sonnet-4-5:high");
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nExact execution tier\n",
+		);
+		const opened = Promise.withResolvers<InteractionRequestEvent>();
+		const broker = new InteractionBroker(
+			() => session.sessionManager.getSessionId(),
+			event => {
+				if (event.change === "opened") opened.resolve(event);
+			},
+		);
+		attachInteractionBroker(broker);
+		vi.spyOn(mode.ui, "showOverlay").mockReturnValue({ hide: vi.fn() } as never);
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const applyRole = vi.spyOn(session, "applyRoleModel");
+		mode.planModeEnabled = true;
+		const review = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Plan" });
+		const request = (await opened.promise).request;
+		if (request.kind !== "plan_review") throw new Error("Expected plan review");
+		const defaultModel = request.models.find(model => model.label.startsWith("default:"));
+		const slowModel = request.models.find(model => model.label.startsWith("slow:"));
+		expect(defaultModel).toBeDefined();
+		expect(slowModel).toBeDefined();
+		expect(defaultModel!.id).not.toBe(slowModel!.id);
+		expect(
+			(
+				await broker.respondToInteraction({
+					...request,
+					action: "plan.approve.keep_context",
+					modelId: slowModel!.id,
+				})
+			).status,
+		).toBe("accepted");
+		await review;
+		expect(applyRole).toHaveBeenCalledWith(
+			expect.objectContaining({
+				role: "slow",
+				thinkingLevel: ThinkingLevel.High,
+				explicitThinkingLevel: true,
+			}),
+		);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("remote plan review refreshes disk drift and rejects stale approvals without consuming native review", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPath, "# Plan\n\nOriginal\n");
+		const opened = Promise.withResolvers<InteractionRequestEvent>();
+		const broker = new InteractionBroker(
+			() => session.sessionManager.getSessionId(),
+			event => {
+				if (event.change === "opened") opened.resolve(event);
+			},
+		);
+		attachInteractionBroker(broker);
+		vi.spyOn(mode.ui, "showOverlay").mockReturnValue({ hide: vi.fn() } as never);
+		mode.planModeEnabled = true;
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const review = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Plan" });
+		const initial = (await opened.promise).request;
+		expect(initial.kind).toBe("plan_review");
+		if (initial.kind !== "plan_review") throw new Error("Expected plan review");
+		expect(initial.plan).toContain("Original");
+		expect((await broker.respondToInteraction({ ...initial, action: "plan.save_and_quit" })).status).toBe(
+			"local_required",
+		);
+		expect((await broker.respondToInteraction({ ...initial, action: "plan.refine", feedback: "  " })).status).toBe(
+			"invalid",
+		);
+		await Bun.write(resolvedPath, "# Plan\n\nChanged on disk\n");
+		expect((await broker.respondToInteraction({ ...initial, action: "plan.approve.execute" })).status).toBe("stale");
+		const [updated] = broker.getPendingInteractions();
+		expect(updated.revision).toBeGreaterThan(initial.revision);
+		if (updated.kind !== "plan_review") throw new Error("Expected plan review");
+		expect(updated.plan).toContain("Changed on disk");
+		expect(updated.contentHash).not.toBe(initial.contentHash);
+		expect((await broker.respondToInteraction({ ...initial, action: "cancel" })).status).toBe("stale");
+		expect((await broker.respondToInteraction({ ...updated, action: "cancel" })).status).toBe("accepted");
+		await review;
+		expect(prompt).not.toHaveBeenCalled();
+		expect(broker.getPendingInteractions()).toEqual([]);
+	});
+
+	it("invalid native refinement unlocks the real overlay and local cancel wins over a late remote approval", async () => {
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nNative decision\n",
+		);
+		const opened = Promise.withResolvers<InteractionRequestEvent>();
+		const broker = new InteractionBroker(
+			() => session.sessionManager.getSessionId(),
+			event => {
+				if (event.change === "opened") opened.resolve(event);
+			},
+		);
+		attachInteractionBroker(broker);
+		let overlay: PlanReviewOverlay | undefined;
+		vi.spyOn(mode.ui, "showOverlay").mockImplementation(component => {
+			overlay = component as PlanReviewOverlay;
+			return { hide: vi.fn() } as never;
+		});
+		mode.planModeEnabled = true;
+		const review = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Plan" });
+		const request = (await opened.promise).request;
+		if (!overlay) throw new Error("Expected native review overlay");
+		overlay.handleInput("\x1b[B");
+		overlay.handleInput("\x1b[B");
+		overlay.handleInput("\x1b[B");
+		overlay.handleInput("\r");
+		await Promise.resolve();
+		expect(broker.getPendingInteractions()).toHaveLength(1);
+		overlay.handleInput("\x1b");
+		await review;
+		expect((await broker.respondToInteraction({ ...request, action: "plan.approve.execute" })).status).toBe("stale");
+	});
+
+	it("remote refine uses native pending input and revokes the accepted capability", async () => {
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nRefine me\n",
+		);
+		const opened = Promise.withResolvers<InteractionRequestEvent>();
+		const broker = new InteractionBroker(
+			() => session.sessionManager.getSessionId(),
+			event => {
+				if (event.change === "opened") opened.resolve(event);
+			},
+		);
+		attachInteractionBroker(broker);
+		vi.spyOn(mode.ui, "showOverlay").mockReturnValue({ hide: vi.fn() } as never);
+		mode.planModeEnabled = true;
+		const submit = vi.fn();
+		mode.onInputCallback = submit;
+		const review = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Plan" });
+		const request = (await opened.promise).request;
+		expect(
+			(await broker.respondToInteraction({ ...request, action: "plan.refine", feedback: "Add rollback steps" }))
+				.status,
+		).toBe("accepted");
+		await review;
+		expect(submit).toHaveBeenCalledTimes(1);
+		expect(submit.mock.calls[0][0].text).toBe("Add rollback steps");
+		expect((await broker.respondToInteraction({ ...request, action: "plan.approve.execute" })).status).toBe("stale");
+	});
+
+	it.each(["plan.approve.execute", "plan.approve.compact", "plan.approve.keep_context"] as const)(
+		"remote %s dispatches through native plan orchestration",
+		async action => {
+			const planFilePath = "local://PLAN.md";
+			const content = "# Plan\n\nExecute reviewed bytes\n";
+			await Bun.write(
+				resolveLocalUrlToPath(planFilePath, {
+					getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+					getSessionId: () => session.sessionManager.getSessionId(),
+				}),
+				content,
+			);
+			const opened = Promise.withResolvers<InteractionRequestEvent>();
+			const broker = new InteractionBroker(
+				() => session.sessionManager.getSessionId(),
+				event => {
+					if (event.change === "opened") opened.resolve(event);
+				},
+			);
+			attachInteractionBroker(broker);
+			vi.spyOn(mode.ui, "showOverlay").mockReturnValue({ hide: vi.fn() } as never);
+			vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 100, contextWindow: 10000, percent: 1 });
+			const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+			const compact = vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("ok");
+			const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+			mode.planModeEnabled = true;
+			const review = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Plan" });
+			const request = (await opened.promise).request;
+			expect((await broker.respondToInteraction({ ...request, action })).status).toBe("accepted");
+			await review;
+			expect(clear).toHaveBeenCalledTimes(action === "plan.approve.execute" ? 1 : 0);
+			expect(compact).toHaveBeenCalledTimes(action === "plan.approve.compact" ? 1 : 0);
+			const approved = prompt.mock.calls.find(isPlanApprovedCall);
+			expect(approved).toBeDefined();
+			expect(approved?.[0]).toContain(content);
+			expect(broker.getPendingInteractions()).toEqual([]);
+		},
+	);
 
 	it("exits empty plan mode without confirmation", async () => {
 		const planFilePath = "local://PLAN.md";

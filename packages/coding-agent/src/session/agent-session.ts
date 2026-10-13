@@ -8126,6 +8126,8 @@ export class AgentSession implements SettingsScope {
 
 		return {
 			ui: noOpUIContext,
+			getPendingInteractions: () => [],
+			respondToInteraction: async () => ({ status: "stale" }),
 			mode: "print",
 			hasUI: false,
 			cwd: this.sessionManager.getCwd(),
@@ -9726,6 +9728,9 @@ export class AgentSession implements SettingsScope {
 		// auto-starting a fresh turn during cleanup.
 		this.#abortInProgress = true;
 		try {
+			// Native interrupts also enter here without an extension context or dialog
+			// signal. Revoke decision capabilities before yielding to abort cleanup.
+			this.#extensionRunner?.interactions.closeAll("aborted");
 			this.#titleGenerationAbortController.abort();
 			if (!this.#isDisposed) this.#titleGenerationAbortController = new AbortController();
 			this.#abortAutolearnCapture();
