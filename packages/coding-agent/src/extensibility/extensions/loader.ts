@@ -207,6 +207,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		}
 	}
 
+	hasCapability(capability: string): boolean {
+		return capability === "interaction-requests";
+	}
+
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);

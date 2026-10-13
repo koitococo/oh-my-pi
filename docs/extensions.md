@@ -68,6 +68,27 @@ Important constraint from `loader.ts`:
 
 ## Native ask and plan-review interactions
 
+Extensions that depend on these fork-specific features must check the host before
+registering handlers or starting a transport:
+
+```ts
+export default function (pi: ExtensionAPI) {
+  if (typeof pi.hasCapability !== "function" || !pi.hasCapability("interaction-requests")) {
+    return;
+  }
+
+  pi.on("interaction_request", (event, ctx) => {
+    // Forward the snapshot to your transport without waiting for a human response.
+  });
+}
+```
+
+`pi.hasCapability("interaction-requests")` advertises the complete contract:
+the `interaction_request` event plus `ctx.getPendingInteractions()` and
+`ctx.respondToInteraction(response)`. Unknown capability names return `false`.
+The `typeof` guard keeps the extension inert on older hosts that do not expose
+`hasCapability`; do not infer support from a version number or repository name.
+
 Interactive mode exposes its existing ask dialog and plan-review decisions through
 `ctx.getPendingInteractions()` and `ctx.respondToInteraction(response)`. Subscribe
 to `pi.on("interaction_request", ...)` before querying pending requests so a
@@ -158,6 +179,7 @@ export default function (pi: ExtensionAPI) {
 
 Core methods:
 
+- `hasCapability(capability)`
 - `on(event, handler)`
 - `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`
 - `registerMessageRenderer`, `registerAssistantThinkingRenderer`

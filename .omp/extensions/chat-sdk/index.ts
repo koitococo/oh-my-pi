@@ -2,6 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { config, SlackInteractions } from "./transport";
 
 export default function slackInteractions(pi: ExtensionAPI) {
+	if (typeof pi.hasCapability !== "function" || !pi.hasCapability("interaction-requests")) return;
+
 	let context: ExtensionContext;
 	let transport: SlackInteractions | undefined;
 	let server: Bun.Server<undefined> | undefined;

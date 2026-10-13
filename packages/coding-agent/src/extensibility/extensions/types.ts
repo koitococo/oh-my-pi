@@ -1564,6 +1564,12 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
  * Methods retain their extension binding when destructured or passed as callbacks.
  */
 export interface ExtensionAPI {
+	/**
+	 * Whether the host supports a complete extension capability. Unknown capabilities return false.
+	 * "interaction-requests" includes interaction_request events and context interaction query/response methods.
+	 */
+	hasCapability(capability: string): boolean;
+
 	// =========================================================================
 	// Module Access
 	// =========================================================================

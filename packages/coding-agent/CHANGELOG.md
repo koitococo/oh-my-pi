@@ -5,6 +5,8 @@
 ### Added
 
 - Exposed native ask and plan-review interactions to extensions with scoped snapshots and first-valid-response arbitration, and added a project-local Chat SDK Slack extension for answering questions and reviewing plans through interactive cards. Remote plan decisions use native execution/compaction/refinement paths; save-and-quit remains in the local terminal.
+- Added `ExtensionAPI.hasCapability("interaction-requests")` so extensions can enable native interaction transports only on supporting hosts; unknown capabilities return `false`.
+- Added `bash scripts/build-install-ompc.sh` to build the current worktree with mise-managed Bun 1.4 and incremental native caches, smoke-test it, and atomically install `~/.local/bin/ompc` without replacing `omp`.
 
 ## [18.10.3] - 2026-10-12
 

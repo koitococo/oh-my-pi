@@ -616,6 +616,14 @@ bun dev
 
 `bun setup` installs Bun workspaces and builds `@oh-my-pi/pi-natives`. Re-run `bun run build:native` after changing Rust crates or `packages/natives`.
 
+For this fork's local standalone build and install, preinstall `mise` and the Rust toolchain/system dependencies described in the [development setup guide](packages/coding-agent/DEVELOPMENT.md), then run (Bun 1.4 and CMake 4 are provided through `mise exec`; no separate CMake installation is needed):
+
+```sh
+bash scripts/build-install-ompc.sh
+```
+
+The script builds the worktree containing the script (regardless of the caller's working directory), using mise-managed Bun 1.4 for all Bun commands and `mise exec bun@1.4 cmake@4 -- bun run build:native` for the native build. It installs frozen dependencies and performs a full build with the native Cargo `local` profile, reusing the worktree's incremental caches without clearing them. Only after the candidate passes `--version` and `--smoke-test` does it atomically install `~/.local/bin/ompc`; an existing `ompc` is preserved on failure, and `omp` is untouched.
+
 Nix users get the pinned Bun and Rust toolchains plus all native build dependencies:
 
 ```sh
