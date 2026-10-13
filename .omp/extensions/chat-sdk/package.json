@@ -1,0 +1,27 @@
+{
+	"name": "@oh-my-pi/extension-chat-sdk",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "../../../node_modules/.bin/tsgo -p tsconfig.json",
+		"test": "bun test",
+		"smoke": "bun test transport.test.ts --test-name-pattern 'actual SDK signed HTTP'"
+	},
+	"dependencies": {
+		"@chat-adapter/slack": "4.41.1",
+		"@chat-adapter/state-memory": "4.41.1",
+		"chat": "4.41.1"
+	},
+	"devDependencies": {
+		"@types/bun": "1.4.2"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": ">=18.10.3"
+	},
+	"omp": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}

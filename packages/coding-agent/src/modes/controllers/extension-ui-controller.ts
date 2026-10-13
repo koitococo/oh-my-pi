@@ -41,6 +41,9 @@ import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../sessi
 import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
+import { launchTerminal } from "../../subprocess/terminal-launch";
+import type { InteractionBroker } from "../../extensibility/extensions/interaction-broker";
+import type { InteractionResponse } from "../../extensibility/extensions/types";
 
 const MAX_WIDGET_LINES = 10;
 
@@ -56,6 +59,18 @@ const ASK_OTHER_OPTION = "Other (type your own)";
 const ASK_CHAT_OPTION = "Chat about this";
 const ASK_NEXT_OPTION = "Next →";
 
+function withTerminalLauncher(uiContext: ExtensionUIContext, hasUI: boolean): ExtensionUIContext {
+	if (!hasUI || uiContext.openTerminal) return uiContext;
+	const descriptors = Object.getOwnPropertyDescriptors(uiContext);
+	descriptors.openTerminal = {
+		configurable: true,
+		enumerable: true,
+		value: launchTerminal,
+		writable: true,
+	};
+	return Object.create(Object.getPrototypeOf(uiContext), descriptors) as ExtensionUIContext;
+}
+
 async function editDialogExternally(text: string): Promise<string | null> {
 	const command = getEditorCommand();
 	return command ? openInEditor(command, text) : null;
@@ -66,10 +81,7 @@ interface CollabDialogWinner {
 	value: string | undefined;
 }
 
-interface CollabAskDialogWinner {
-	source: "local" | "remote";
-	value: ExtensionAskDialogResult | undefined;
-}
+type AskAnswers = NonNullable<InteractionResponse["answers"]>;
 /** Tagged result from a guest UI request, distinguishing a real answer (even
  *  one whose literal value is "unavailable"), an explicit guest cancel, and a
  *  transport-unavailable sentinel (collab teardown / abort). Replaces the old
@@ -104,6 +116,11 @@ export class ExtensionUiController {
 	 */
 	#toolUIContext: ExtensionUIContext | undefined;
 	constructor(private ctx: InteractiveModeContext) {}
+	#interactionBroker: InteractionBroker | undefined;
+
+	setInteractionBroker(broker: InteractionBroker): void {
+		this.#interactionBroker = broker;
+	}
 
 	#syncExtensionComposerShapes(): void {
 		this.disposeComposerShapes();
@@ -125,6 +142,7 @@ export class ExtensionUiController {
 		// Create and set hook & tool UI context
 		const uiContext: ExtensionUIContext = {
 			timeoutStartsOnPresentation: true,
+			supportsEditor: true,
 			select: (title, options, dialogOptions) => this.showCollabAwareSelector(title, options, dialogOptions),
 			confirm: (title, message, dialogOptions) => this.showHookConfirm(title, message, dialogOptions),
 			input: (title, placeholder, dialogOptions) => this.showHookInput(title, placeholder, dialogOptions),
@@ -166,8 +184,9 @@ export class ExtensionUiController {
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
 			setToolsExpanded: expanded => this.ctx.setToolsExpanded(expanded),
 		};
-		this.ctx.setToolUIContext(uiContext, true);
-		this.#toolUIContext = uiContext;
+		const enrichedUiContext = withTerminalLauncher(uiContext, true);
+		this.ctx.setToolUIContext(enrichedUiContext, true);
+		this.#toolUIContext = enrichedUiContext;
 		this.ctx.session.setUsageFallbackConfirmer?.((confirmation, signal) => {
 			const reserve =
 				confirmation.remainingPercent === undefined
@@ -317,7 +336,7 @@ export class ExtensionUiController {
 			},
 		};
 
-		extensionRunner.initialize(actions, contextActions, commandActions, uiContext, "tui");
+		extensionRunner.initialize(actions, contextActions, commandActions, enrichedUiContext, "tui");
 
 		// Subscribe to extension errors
 		extensionRunner.onError((error: ExtensionError) => {
@@ -541,7 +560,8 @@ export class ExtensionUiController {
 			},
 		};
 
-		extensionRunner.initialize(actions, contextActions, commandActions, uiContext, "tui");
+		const runnerUiContext = withTerminalLauncher(uiContext, _hasUI);
+		extensionRunner.initialize(actions, contextActions, commandActions, runnerUiContext, "tui");
 		this.#syncExtensionComposerShapes();
 	}
 
@@ -627,28 +647,142 @@ export class ExtensionUiController {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
-		// Normalize the public extension input once for both race participants:
-		// malformed entries (missing/non-string fields) coerce to empty
-		// strings/arrays here instead of throwing inside `sanitizeCarriageReturns`
-		// on the guest path or taking down the local render.
 		const normalized = normalizeDialogQuestions(questions);
-		const host = this.ctx.collabHost;
-		if (!host) return this.#showLocalAskDialog(normalized, dialogOptions);
+		if (dialogOptions?.signal?.aborted) return undefined;
+		const broker = this.#interactionBroker ?? this.ctx.session.extensionRunner?.interactions;
 		const localAbort = new AbortController();
 		const remoteAbort = new AbortController();
-		const parentSignal = dialogOptions?.signal;
-		const localSignal = parentSignal ? AbortSignal.any([parentSignal, localAbort.signal]) : localAbort.signal;
-		const remoteSignal = parentSignal ? AbortSignal.any([parentSignal, remoteAbort.signal]) : remoteAbort.signal;
-		const localWinner = this.#showLocalAskDialog(normalized, { ...dialogOptions, signal: localSignal }).then(
-			(value): CollabAskDialogWinner => ({ source: "local", value }),
+		const { promise, resolve, reject } = Promise.withResolvers<ExtensionAskDialogResult | undefined>();
+		const nativeResults = new WeakMap<AskAnswers, ExtensionAskDialogResult>();
+		let finished = false;
+		const finish = (value: ExtensionAskDialogResult | undefined): void => {
+			if (finished) return;
+			finished = true;
+			dialogOptions?.signal?.removeEventListener("abort", onAbort);
+			localAbort.abort();
+			remoteAbort.abort();
+			resolve(value);
+		};
+		const handle = broker?.open(
+			{
+				kind: "ask",
+				questions: normalized,
+				timeout: dialogOptions?.timeout,
+				actions: [
+					{ id: "ask.submit", label: "Submit answers" },
+					{ id: "ask.chat", label: ASK_CHAT_OPTION },
+					{ id: "cancel", label: "Cancel" },
+				],
+			},
+			{
+				validate: response =>
+					response.answers && nativeResults.has(response.answers)
+						? undefined
+						: this.#validateAskResponse(normalized, response),
+				resolve: response => {
+					if (response.action === "cancel") finish(undefined);
+					else if (response.action === "ask.chat") finish({ kind: "chat" });
+					else {
+						const answers = response.answers!;
+						finish(
+							nativeResults.get(answers) ?? {
+								kind: "submit",
+								results: normalized.map(question => {
+									const answer = answers.find(item => item.id === question.id)!;
+									return {
+										id: question.id,
+										question: question.question,
+										options: question.options.map(option => option.label),
+										multi: question.multi ?? false,
+										selectedOptions: [...answer.selectedOptions],
+										customInput: answer.customAnswer,
+										note: answer.note,
+									};
+								}),
+							},
+						);
+					}
+				},
+				onClose: () => finish(undefined),
+			},
 		);
-		const remoteWinner: Promise<CollabAskDialogWinner> = this.#runGuestAskDialog(host, normalized, remoteSignal).then(
-			result => (result === "unavailable" ? localWinner : { source: "remote", value: result }),
-		);
-		const winner = await Promise.race([localWinner, remoteWinner]);
-		if (winner.source === "remote") localAbort.abort();
-		else remoteAbort.abort();
-		return winner.value;
+		function onAbort(): void {
+			handle?.close("aborted");
+			finish(undefined);
+		}
+		dialogOptions?.signal?.addEventListener("abort", onAbort, { once: true });
+		if (dialogOptions?.signal?.aborted) onAbort();
+		const submit = async (value: ExtensionAskDialogResult | undefined, native = false): Promise<void> => {
+			if (finished) return;
+			if (!handle) {
+				finish(value);
+				return;
+			}
+			const answers =
+				value?.kind === "submit"
+					? value.results.map(item => ({
+							id: item.id,
+							selectedOptions: item.selectedOptions,
+							customAnswer: item.customInput,
+							note: item.note,
+						}))
+					: undefined;
+			if (native && answers && value) nativeResults.set(answers, value);
+			await handle.respond({
+				action: value === undefined ? "cancel" : value.kind === "chat" ? "ask.chat" : "ask.submit",
+				answers,
+			});
+		};
+		const fail = (error: unknown): void => {
+			if (finished) return;
+			finished = true;
+			handle?.close("failed");
+			localAbort.abort();
+			remoteAbort.abort();
+			dialogOptions?.signal?.removeEventListener("abort", onAbort);
+			reject(error);
+		};
+		void this.#showLocalAskDialog(normalized, { ...dialogOptions, signal: localAbort.signal })
+			.then(value => submit(value, true))
+			.catch(fail);
+		const host = this.ctx.collabHost;
+		if (host) {
+			void this.#runGuestAskDialog(host, normalized, remoteAbort.signal)
+				.then(value => (value === "unavailable" ? undefined : submit(value)))
+				.catch(() => {
+					// A disconnected guest is not a user decision; leave the native UI available.
+				});
+		}
+		return promise;
+	}
+
+	#validateAskResponse(questions: ExtensionAskDialogQuestion[], response: InteractionResponse): string | undefined {
+		if (response.action === "cancel" || response.action === "ask.chat") return undefined;
+		if (response.action !== "ask.submit") return "Unsupported ask action";
+		const answers = response.answers;
+		if (!Array.isArray(answers) || answers.length !== questions.length) return "Answer every question exactly once";
+		const seen = new Set<string>();
+		for (const answer of answers) {
+			if (!answer || typeof answer.id !== "string" || seen.has(answer.id)) return "Invalid or duplicate question";
+			seen.add(answer.id);
+			const question = questions.find(item => item.id === answer.id);
+			if (!question) return "Unknown question";
+			if (!Array.isArray(answer.selectedOptions)) return "Invalid selected options";
+			const selected = answer.selectedOptions;
+			if (
+				selected.some(
+					label => typeof label !== "string" || !question.options.some(option => option.label === label),
+				) ||
+				new Set(selected).size !== selected.length ||
+				(!question.multi && selected.length > 1)
+			)
+				return "Invalid selected options";
+			if (answer.customAnswer !== undefined && typeof answer.customAnswer !== "string")
+				return "Invalid custom answer";
+			if (answer.note !== undefined && typeof answer.note !== "string") return "Invalid note";
+			if (selected.length === 0 && !answer.customAnswer?.trim()) return "Each question requires an answer";
+		}
+		return undefined;
 	}
 
 	#showLocalAskDialog(
@@ -1011,6 +1145,7 @@ export class ExtensionUiController {
 					checkedIndices: dialogOptions?.checkedIndices,
 					markableCount: dialogOptions?.markableCount,
 					maxVisible,
+					inline: dialogOptions?.inline,
 					slider: extra?.slider,
 				},
 			);
@@ -1036,7 +1171,11 @@ export class ExtensionUiController {
 	/**
 	 * Show a confirmation dialog for hooks.
 	 */
-	async showHookConfirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
+	async showHookConfirm(
+		title: string,
+		message: string,
+		dialogOptions?: InteractiveSelectorDialogOptions,
+	): Promise<boolean> {
 		const result = await this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], dialogOptions);
 		return result === "Yes";
 	}

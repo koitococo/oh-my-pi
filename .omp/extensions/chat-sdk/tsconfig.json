@@ -1,0 +1,6 @@
+{
+	"extends": "../../../packages/coding-agent/tsconfig.json",
+	"compilerOptions": { "paths": { "@oh-my-pi/pi-coding-agent": ["../../../packages/coding-agent/src/index.ts"] } },
+	"include": ["*.ts"],
+	"exclude": ["node_modules"]
+}

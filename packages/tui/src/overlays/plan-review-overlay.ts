@@ -378,6 +378,12 @@ export class PlanReviewOverlay implements Component {
 		for (const section of this.#sections) section.md.invalidate();
 	}
 
+	/** Share native submission locking with external decisions, and unlock a rejected native choice. */
+	setDecisionPending(pending: boolean, label?: string): void {
+		this.#committed = pending;
+		this.#committedLabel = pending ? label : undefined;
+	}
+
 	/** Swap the displayed plan (e.g. after an external-editor round-trip) and
 	 *  reset scroll/focus so the operator starts at the top. Does not emit
 	 *  `onPlanEdited` (the editor round-trip already persisted the file). */

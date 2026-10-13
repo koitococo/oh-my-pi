@@ -2,6 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { InteractionBroker } from "./interaction-broker";
 import {
 	type AgentMessage,
 	type AgentTool,
@@ -34,7 +35,7 @@ import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
@@ -61,6 +62,8 @@ import type {
 	Extension,
 	ExtensionActions,
 	ExtensionAgentIdentity,
+	ExtensionAnnotationsAPI,
+	ExtensionAnnotationsFactory,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,
@@ -438,6 +441,7 @@ export type ShutdownHandler = () => void;
  */
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
 	if (!extensionRunner) return false;
+	extensionRunner.interactions.closeAll("session_shutdown");
 	try {
 		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
 		await extensionRunner.emit({
@@ -493,7 +497,19 @@ export const TOP_LEVEL_AGENT: ExtensionAgentIdentity = Object.freeze({
 	depth: 0,
 });
 
+/** `ctx.annotations` for hosts that inject no implementation: every call rejects. */
+export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
+	submit: () => Promise.reject(new Error("ctx.annotations is not available in this host.")),
+	open: () => Promise.reject(new Error("ctx.annotations is not available in this host.")),
+});
+
 export class ExtensionRunner {
+	readonly interactions = new InteractionBroker(
+		() => this.sessionId,
+		event => {
+			void this.emit(event);
+		},
+	);
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
@@ -516,6 +532,7 @@ export class ExtensionRunner {
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
+	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
 	#toolRegistrationScope = new AsyncLocalStorage<ToolRegistrationScope>();
 	#toolRegistrationBarrier: Promise<void> | undefined;
@@ -720,9 +737,12 @@ export class ExtensionRunner {
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
 		/** Identity of the agent this runner's session runs; defaults to the top-level agent. */
 		private readonly agent: ExtensionAgentIdentity = TOP_LEVEL_AGENT,
+		/** Builds `ctx.annotations`; supplied by the host that wires the bundled `/annotate` command. */
+		createAnnotations?: ExtensionAnnotationsFactory,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
+		this.#createAnnotations = createAnnotations;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
 	}
 
@@ -772,6 +792,7 @@ export class ExtensionRunner {
 		uiContext?: ExtensionUIContext,
 		mode: ExtensionMode = "print",
 	): void {
+		if (this.#initialized) this.interactions.closeAll("rebound");
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
@@ -1364,8 +1385,13 @@ export class ExtensionRunner {
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
+		const createAnnotations = this.#createAnnotations;
+		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
+			this.runtime.sendUserMessage(text, options);
 		return {
 			ui: this.#uiContext,
+			getPendingInteractions: () => this.interactions.getPendingInteractions(),
+			respondToInteraction: response => this.interactions.respondToInteraction(response),
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
@@ -1381,9 +1407,12 @@ export class ExtensionRunner {
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
 			isIdle: () => this.#isIdleFn(),
-			abort: () => this.#abortFn(),
+			abort: () => {
+				this.interactions.closeAll("aborted");
+				this.#abortFn();
+			},
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
-			shutdown: () => this.#shutdownHandler(),
+			shutdown: () => this.shutdown(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1414,6 +1443,11 @@ export class ExtensionRunner {
 				: undefined,
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
+			// A getter, not a value: `createHandlerContext` scopes a handler via `Object.create(ctx)`, and
+			// `this` here is that receiver, so the overlay mounts through the handler's timeout-aware `ui`.
+			get annotations(): ExtensionAnnotationsAPI {
+				return createAnnotations ? createAnnotations(() => this, sendUserMessage) : UNAVAILABLE_ANNOTATIONS;
+			},
 			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
 			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#managedTimers.clear(timer),
@@ -1437,6 +1471,7 @@ export class ExtensionRunner {
 	 * Request a graceful shutdown. Called by extension tools and event handlers.
 	 */
 	shutdown(): void {
+		this.interactions.closeAll("shutdown");
 		this.#shutdownHandler();
 	}
 
@@ -1575,6 +1610,14 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		if (
+			event.type === "session_shutdown" ||
+			event.type === "session_switch" ||
+			event.type === "session_branch" ||
+			event.type === "session_tree"
+		) {
+			this.interactions.closeAll(event.type);
+		}
 		// Defer the per-event context allocation (and the Promise.race/Bun.sleep
 		// timeout machinery) to the first matching handler. Streaming sessions emit
 		// message_update / tool_execution_* per delta with usually no extension
